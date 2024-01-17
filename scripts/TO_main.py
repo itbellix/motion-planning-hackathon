@@ -6,6 +6,7 @@ import time
 import matplotlib.pyplot as plt
 import utilities_TO as utils_TO
 import pickle
+import pygame
 
 # define the required paths
 code_path = os.path.dirname(os.path.realpath(__file__))     # getting path to where this script resides
@@ -144,19 +145,52 @@ to_module.nlp_module.setSolverOptions(solver = solver, opts = opts)
 to_module.createMPCfunctionInitialGuesses()
 to_module.createMPCfunctionWithoutInitialGuesses()
 
-to_module.current_state_values = x_0
+# initialize pygame to set up a state machine in the code execution logic
+pygame.init()
+
+# create the window that the user will have to keep selected to give their inputs
+window = pygame.display.set_mode((400, 300))
+
+print("Use the following keys to control the robot:") 
+print("- 's' to start the MPC")
+print("- 'q' to stop the execution")
+print("- 't' to trick the MPC, and pretend that we have a reference (debug)")
+
+ros_rate = rospy.Rate(rate_MPC)
+run_MPC = False
 
 if not debug:
         while not rospy.is_shutdown():
-                if to_module.current_state_values is None:
-                        time.sleep(0.5)
-                else:
-                        if np.linalg.norm(to_module.current_state_values[0:2]-x_goal[0:2])>0.2:
-                                x_opt, u_opt, j_opt = to_module.optimize_trajectory()
-                        else:
-                                to_module.send_termination()
-else:
-        x_opt, u_opt, j_opt = to_module.optimize_trajectory()
+
+                for event in pygame.event.get():
+                        if event.type == pygame.KEYDOWN:
+                                if event.key == pygame.K_s:     # user wants to start
+                                        
+                                        if to_module.current_state_values is None:
+                                                print("Not receiving current state estimates \nTry again later...")
+                                        else:   
+                                                print("MPC is starting")
+                                                run_MPC = True
+                                                to_module.togglePublishing(run_MPC)        # start the MPC
+
+                                if event.key == pygame.K_q:     # user wants to quit
+                                        print("Quitting and freezing to current position")
+                                        run_MPC = False
+                                        to_module.togglePublishing(run_MPC)               # stop the MPC
+
+                                if event.key == pygame.K_t:     # user is naughty
+                                        print("User is trying a trick")
+                                        run_MPC = True
+                                        to_module.current_state_values = x_0            # set fictitious starting point
+                                        to_module.togglePublishing(run_MPC)                # start the MPC
+
+                if run_MPC:     # if we need to, run the optimization
+                        to_module.optimize_trajectory()
+
+                ros_rate.sleep()
+else:   
+        to_module.current_state_values = x_0                    # set fictitious starting point for testing
+        x_opt, u_opt, j_opt = to_module.optimize_trajectory()   # optimize the trajectory from there
 
 
         # utilities for plotting while debugging

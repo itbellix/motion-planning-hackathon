@@ -25,6 +25,7 @@ class TO_module:
                                                     # must be consistent (TODO: implement a check for this)
 
         self.x_opt = None                           # Optimal trajectory
+        self.u_opt = None                           # Optimal controls
 
         self.nlp_module = nlp
 
@@ -39,17 +40,42 @@ class TO_module:
 
         # Create publisher for the optimal controls for the robot (it will be executed in another thread)
         self.topic_u_opt = shared_ros_topics['control_values']
-        self.pub_trajectory = rospy.Publisher(self.topic_u_opt, Float64MultiArray, queue_size=1)
+        self.pub_control_ref = rospy.Publisher(self.topic_u_opt, Float64MultiArray, queue_size=1)
 
         # Create a subscriber to listen to the current estimate of the state
         self.topic_state_estimation = shared_ros_topics['state_estimation']
-        # self.sub_crr_shoulder_pose = rospy.Subscriber(self.topic_state_estimation, Float64MultiArray, self._shoulder_pose_cb, queue_size=1)
+        self.sub_curr_state = rospy.Subscriber(self.topic_state_estimation, Float64MultiArray, self._estimated_state_cb, queue_size=1)
         self.flag_receiving_estimation = False       # flag indicating whether the estimated state is being received
 
         # Set up the structure to deal with the new thread, to allow continuous publication of the optimal controls
-        # The thread itself is created later, with parameters known at run time
-        self.x_opt_lock = threading.Lock()          # Lock for synchronizing access to self.x_opt
-        self.publish_thread = None                  # creating the variable that will host the thread
+        self.u_opt_lock = threading.Lock()          # Lock for synchronizing access to self.x_opt
+        self.publish_thread = threading.Thread(target = self.publish_continuous_control)    # creating the thread
+        self.publish_thread.daemon = True           # this allows to terminate the thread when the main program ends
+        self.flag_publishing = False                # variable to command the actual publishing
+
+
+    def _estimated_state_cb(self, data):
+        """
+        Callback to receive the current estimate of the robot's state, and update parameters accordingly
+        """
+        # first, decode the message data
+        # let's assume that data = [x_hat, y_hat, eta_hat, v_hat]
+        self.current_state_values = data
+
+        # if this is the first time that we receive data, update flag
+        if not self.flag_receiving_estimation:
+            self.flag_receiving_estimation = True
+
+
+    def togglePublishing(self, flag):
+        """
+        Flag that allows the user to start/stop the publishing of the optimal controls to the robot
+        """
+        if not self.flag_publishing and flag:       # if no publishing is happening but user wants to
+            if not self.publish_thread.is_alive():
+                self.publish_thread.start()             # start the publishing thread (if not present already)
+        
+        self.flag_publishing = flag                 # assign user choice to the flag
 
 
     def createMPCfunctionWithoutInitialGuesses(self):
@@ -59,6 +85,7 @@ class TO_module:
         while the optimal solution should be optimal state trajectory and control inputs.
         """
         self.MPC_iter = self.nlp_module.createOptimalMapWithoutInitialGuesses()
+
 
     def createMPCfunctionInitialGuesses(self):
         """
@@ -86,11 +113,57 @@ class TO_module:
         
         # update the optimal values that are stored. They can be accessed only if there is no
         # other process that is modifying them
-        with self.x_opt_lock:
+        with self.u_opt_lock:
             self.x_opt = x_opt
             self.u_opt = u_opt
 
         return x_opt, u_opt, j_opt
+    
+
+    def publish_continuous_control(self):
+        """
+        This function picks the most recent information regarding the optimal control, and publishes it to the robot.
+        """
+        rate = rospy.Rate(1/self.nlp_module.h)  # Set the publishing rate (depending on the parameters of the NLP)
+
+        while not rospy.is_shutdown():
+            if self.flag_publishing:        # perform the computations only if needed
+                with self.u_opt_lock:       # get the lock to read and modify references
+                    if self.u_opt is not None:
+                        # We will pick always the first control value, publish it to the robot, and then delete it.
+                        # This is done in blocking mode to avoid conflicts.
+                        if np.shape(self.u_opt)[1]>1:
+                            # If there are many elements left, get the first and then delete it
+                            cmd_control = self.u_opt[:, 0]
+                            self.u_opt = np.delete(self.u_opt, obj=0, axis=1)   # delete the first column
+                            
+                        else:
+                            # If there is only one element left, keep picking it
+                            cmd_control = self.u_opt[:, 0]
+                            self.u_opt = np.array([0, 0])           # make sure that from the next time, the control is 0
+
+                        self.publishControlRef(cmd_control)
+
+            else:
+                # just keep publish zero controls
+                cmd_control = np.zeros((2,1))
+
+                self.publishControlRef(cmd_control)
+
+            rate.sleep()
+
+
+    def publishControlRef(self, control_ref):
+        """
+        This function allows to publish a given control reference to the robot, via a dedicated topic
+        """
+        # assume that the message will be a Float64MultiArray()
+        message_ref = Float64MultiArray()
+        message_ref.layout.data_offset = 0
+        message_ref.data = np.reshape(control_ref, (2,1))   # assume that this is the shape we want
+
+        # publish the reference
+        self.pub_control_ref.publish(message_ref)
     
 
 class nlp_jetracer():
