@@ -16,10 +16,10 @@ path_to_repo = os.path.join(code_path, '..', '..')          # getting path to th
 debug = True
 
 # set the cost weights
-gamma_goal = 10         # weight for distance to goal
-gamma_throttle = 1      # weight for use of throttle input
-gamma_steering = 1      # weight for use of steering input
-gamma_acceleration = 1  # weight on the coordinates' acceleration
+gamma_goal = 1                  # weight for distance to goal
+gamma_throttle = 1e-1           # weight for use of throttle input
+gamma_steering = 1e-2           # weight for use of steering input
+gamma_acceleration = 0          # weight on the coordinates' acceleration
 
 # goal state for the jetracer
 x_goal = 5                      # x desired position
@@ -27,8 +27,8 @@ y_goal = 4                      # y desired position
 eta_goal = np.deg2rad(30)       # eta (orientation) desired
 
 # determine the time horizon and control intervals for the NLP problem
-N = 30  # control intervals used (control will be constant during each interval)
-T = 3.  # time horizon for the optimization
+N = 10  # control intervals used (control will be constant during each interval)
+T = 1.  # time horizon for the optimization
 
 # choose collocation scheme for approximating the system dynamics
 collocation_scheme = 'legendre'         # collocation points
@@ -144,4 +144,50 @@ to_module.nlp_module.setSolverOptions(solver = solver, opts = opts)
 to_module.createMPCfunctionInitialGuesses()
 to_module.createMPCfunctionWithoutInitialGuesses()
 
-x_opt, u_opt, solution = to_module.nlp_module.solveNLPOnce()
+to_module.current_state_values = x_0
+
+if not debug:
+        while not rospy.is_shutdown():
+                if to_module.current_state_values is None:
+                        time.sleep(0.5)
+                else:
+                        if np.linalg.norm(to_module.current_state_values[0:2]-x_goal[0:2])>0.2:
+                                x_opt, u_opt, j_opt = to_module.optimize_trajectory()
+                        else:
+                                to_module.send_termination()
+else:
+        x_opt, u_opt, j_opt = to_module.optimize_trajectory()
+
+
+        # utilities for plotting while debugging
+        # plot the resulting optimal trajectory
+        fig = plt.figure()
+        ax = fig.add_subplot()
+        ax.plot(x_opt[0,:], x_opt[1,:])
+        ax.scatter(x_goal[0], x_goal[1], label='goal position')
+        ax.scatter(x_0[0], x_0[1], label='initial position')
+        ax.legend()
+
+        # plot the behavior of states and controls
+        time_stamps = np.arange(0, N+1, 1)*T/N
+        fig = plt.figure()
+        ax = fig.add_subplot()
+        ax.plot(time_stamps, x_opt[0], label='x position')
+        ax.plot(time_stamps, x_opt[1], label='y position')
+        ax.plot(time_stamps, x_opt[2], label='eta orientation')
+        ax.plot(time_stamps, x_opt[3], label='forward velocity')
+        ax.set_title('States')
+        ax.set_xlabel('time [s]')
+        ax.legend()
+
+        fig = plt.figure()
+        ax = fig.add_subplot()
+        ax.plot(time_stamps[0:-1], u_opt[0], label='throttle')
+        ax.plot(time_stamps[0:-1], u_opt[1], label='steering input')
+        ax.set_title('Controls')
+        ax.set_xlabel('time [s]')
+        ax.legend()
+
+        plt.show()
+
+        aux = 0

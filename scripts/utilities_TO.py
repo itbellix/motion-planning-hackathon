@@ -33,42 +33,23 @@ class TO_module:
         self.MPC_iter = None                        # CasADi function that maps initial state to the optimal control
 
 
-            # # initialize ROS node and set required frequency
-            # rospy.init_node('TO_module')
-            # self.ros_rate = rospy.Rate(rate)
+        # initialize ROS node and set required frequency
+        rospy.init_node('TO_module')
+        self.ros_rate = rospy.Rate(rate)
 
-            # # Create publisher for the optimal trajectory for the robot
-            # self.topic_opt_traj = shared_ros_topics['optimal_cartesian_ref_ee']
-            # self.pub_trajectory = rospy.Publisher(self.topic_opt_traj, Float64MultiArray, queue_size=1)
+        # Create publisher for the optimal controls for the robot (it will be executed in another thread)
+        self.topic_u_opt = shared_ros_topics['control_values']
+        self.pub_trajectory = rospy.Publisher(self.topic_u_opt, Float64MultiArray, queue_size=1)
 
-            # # Create publisher for the initial cartesian pose of the KUKA end-effector, and subscriber to the topic which stops the
-            # # publishing stream.
-            # self.topic_init_pose = shared_ros_topics['cartesian_init_pose']
-            # self.pub_init_pose = rospy.Publisher(self.topic_init_pose, Float64MultiArray, queue_size=1)
-            # self.keep_publishing_init_pose = None       # flag indicating if pub_init_pose should keep publishing or not
+        # Create a subscriber to listen to the current estimate of the state
+        self.topic_state_estimation = shared_ros_topics['state_estimation']
+        # self.sub_crr_shoulder_pose = rospy.Subscriber(self.topic_state_estimation, Float64MultiArray, self._shoulder_pose_cb, queue_size=1)
+        self.flag_receiving_estimation = False       # flag indicating whether the estimated state is being received
 
-            # self.sub_stop_pub_init_pose = rospy.Subscriber(self.topic_init_pose+'/stop', Bool, self._stop_pub_init_pose_cb, queue_size=10)
-
-            # # Create a subscriber to listen to the current value of the shoulder pose
-            # self.topic_shoulder_pose = shared_ros_topics['estimated_shoulder_pose']
-            # self.sub_crr_shoulder_pose = rospy.Subscriber(self.topic_shoulder_pose, Float64MultiArray, self._shoulder_pose_cb, queue_size=1)
-            # self.flag_receiving_shoulder_pose = False       # flag indicating whether the shoulder pose is being received
-
-            # # Create the publishers dedicated to stream the optimal trajectories and controls (they will be executed in another thread)
-            # self.flag_pub_trajectory = False    # flag to check if trajectory is being published (default: False = no publishing)
-            # self.topic_optimal_trajectory_shoulder = 'optimal_trajectory_shoulder'
-            # self.topic_optimal_controls_shoulder_torques = 'optimal_controls_shoulder_torques'
-            # self.pub_optimal_trajectory = rospy.Publisher(self.topic_optimal_trajectory_shoulder, Float64MultiArray, queue_size=1)
-            # self.pub_optimal_torques = rospy.Publisher(self.topic_optimal_controls_shoulder_torques, Float64MultiArray, queue_size=1)
-
-            # # Set up the structure to deal with the new thread, to allow continuous publication of the optimal trajectory and torques
-            # # The thread itself is created later, with parameters known at run time
-            # self.x_opt_lock = threading.Lock()          # Lock for synchronizing access to self.x_opt
-            # self.publish_thread = None                  # creating the variable that will host the thread
-
-            # # create a subscriber to catch when the trajectory optimization should be running
-            # self.flag_run_optimization = False
-            # self.sub_run_optimization = rospy.Subscriber(shared_ros_topics['request_reference'], Bool, self._flag_run_optimization_cb, queue_size=1)
+        # Set up the structure to deal with the new thread, to allow continuous publication of the optimal controls
+        # The thread itself is created later, with parameters known at run time
+        self.x_opt_lock = threading.Lock()          # Lock for synchronizing access to self.x_opt
+        self.publish_thread = None                  # creating the variable that will host the thread
 
 
     def createMPCfunctionWithoutInitialGuesses(self):
@@ -89,19 +70,27 @@ class TO_module:
         self.MPC_iter_initGuess = self.nlp_module.createOptimalMapInitialGuesses()
 
 
-    def upsampleSolution(self, solution, N, T, target_freq):
+    def optimize_trajectory(self):
         """
-        The function is dedicated to upsampling a given solution for the trajectory of the shoulder pose
-        (consisting of N points over a time horizon of T seconds) to a target frequency required.
-        Note that only the generalized coordinates are upsampled, as we do not care about the velocities.
-        The interpolation is linear over the initial datapoints! Using SciPy, we could interpolate also in
-        a different way.
+        This function computes the optimal trajectory towards the goal position, given the current state.
+        The optimal trajectory and set of controls to follow it are saved, to be executed by the robot.
+        NOTE: The optimization is not warm-started.
         """
-        required_points = int(np.ceil(target_freq*T))
-        upsampled_indices = np.linspace(0, solution.shape[1] - 1, required_points)
-        solution = solution[0::2, :]
-        upsampled_solution = np.array([np.interp(upsampled_indices, np.arange(solution.shape[1]), row) for row in solution])
-        return upsampled_solution
+        initial_state = self.current_state_values
+
+        u_opt, x_opt, j_opt = self.MPC_iter(initial_state)
+
+        # convert the solution to numpy arrays, and store them to be processed
+        x_opt = x_opt.full().reshape(self.nlp_module.dim_x, self.nlp_module.N+1, order='F')
+        u_opt = u_opt.full().reshape(self.nlp_module.dim_u, self.nlp_module.N, order='F')
+        
+        # update the optimal values that are stored. They can be accessed only if there is no
+        # other process that is modifying them
+        with self.x_opt_lock:
+            self.x_opt = x_opt
+            self.u_opt = u_opt
+
+        return x_opt, u_opt, j_opt
     
 
 class nlp_jetracer():
@@ -261,15 +250,22 @@ class nlp_jetracer():
         if self.x_0 is None:
             RuntimeError("Unable to continue. The initial state of the NLP has not been set yet. \
                          Do so with setInitialState()!")
+            
+        epsilon = 1e-8  # to avoid numerical instability
         
         # create the function capturing the dynamics of the robot
         x_dot = self.x[3]*ca.cos(self.x[2])
         y_dot = self.x[3]*ca.sin(self.x[2])
-        eta_dot = self.x[3]/self.car_length * ca.tan((self.c + self.u[1])/self.b)
+        eta_dot = self.x[3]/self.car_length * ca.tan((self.c + self.u[1])/self.b)   # this is the correct one (?)
+        # eta_dot = self.u[1]   # this is for debugging
 
         # friction model
         static_friction = ca.tanh(self.v_friction_static_tanh_mult  * self.x[3]) * self.v_friction_static
-        v_contribution = - static_friction - self.x[3] * self.v_friction - ca.sign(self.x[3]) * self.x[3] ** 2 * self.v_friction_quad 
+
+        # replacement_for_sign = self.x[3]/(ca.norm_2(self.x[3])+epsilon) * (self.x[3] ** 2) * self.v_friction_quad # with sign(x) = x/norm(x)
+        replacement_for_sign = ca.tanh(10*self.x[3]) * self.x[3] ** 2 * self.v_friction_quad # with sign(x) ~= tanh(k*x)
+
+        v_contribution = - static_friction - self.x[3] * self.v_friction - replacement_for_sign
         
         #for positive throttle
         th_activation1 = (ca.tanh((self.u[0] - self.tau_offset) * self.tau_steepness) + 1) * self.tau_sat_high
@@ -282,16 +278,16 @@ class nlp_jetracer():
         Fx_f = Fx * 0.5
 
         v_dot =  Fx_r + Fx_f
+        # v_dot = self.u[0]       # for debugging
 
         state_dot = ca.vertcat(x_dot, y_dot, eta_dot, v_dot)
 
         # define also the cost function (without acceleration term yet, will be added in the NLP formulation)
         L = self.gamma_goal *ca.norm_2(self.x-self.goal) + \
-            self.gamma_throttle * self.u[0]**2 + \
-            self.gamma_steering * self.u[1]**2
+            self.gamma_throttle * self.u[0]**2 
 
         # CasADi function that evaluates cost and state derivative given the current state and control vectors
-        self.sys_dynamics = ca.Function('cost_function', [self.x, self.u], [L, state_dot])
+        self.sys_dynamics = ca.Function('cost_function', [self.x, self.u], [state_dot, L])
 
         # set cost
         J = 0
@@ -313,12 +309,19 @@ class nlp_jetracer():
         self.params_list.append(p)              # add the parameter to the list of parameters for the NLP
         self.opti.subject_to(Xk==p)
 
+        U_prev = self.opti.variable(self.dim_u)
+        self.opti.subject_to(U_prev == 0)
+
         # Collect all states/controls
         Xs = [Xk]
         Us = []
 
         # formulate the NLP
         for k in range(self.N):
+            # constraints for the state
+            # self.opti.subject_to(np.array([-ca.inf, -ca.inf, -ca.pi/2, 0])<= Xk)
+            # self.opti.subject_to(Xk <= np.array([ca.inf, ca.inf, ca.pi/2, ca.inf]))
+
             # New NLP variable for the control
             Uk = self.opti.variable(self.dim_u)
             Us.append(Uk)
@@ -333,6 +336,12 @@ class nlp_jetracer():
 
             # add contribution to quadrature function
             J = J + self.h*ca.mtimes(quad, self.B)
+
+            # add continuity term for the steering input
+            J = J + self.gamma_steering*(Uk[1] - U_prev[1])**2 + self.gamma_steering * Uk[1]**2
+
+            # add acceleration minimization
+            J = J + self.gamma_acceleration * self.h*ca.mtimes(ode[3,:], self.B)
 
             # get interpolating points of collocation polynomial
             Z = ca.horzcat(Xk, Xc)
@@ -352,6 +361,9 @@ class nlp_jetracer():
 
             # continuity constraint
             self.opti.subject_to(Xk_end==Xk)
+
+            # save current control input
+            U_prev = Uk
 
         # adding constraint to reach the final desired state
         self.opti.subject_to(Xk[3]==self.goal[3])   # constraint on final (zero) velocity
